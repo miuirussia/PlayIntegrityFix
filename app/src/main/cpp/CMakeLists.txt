@@ -6,8 +6,12 @@ find_package(cxx REQUIRED CONFIG)
 
 link_libraries(cxx::cxx)
 
-add_library(${CMAKE_PROJECT_NAME} SHARED module.cpp)
+add_library(${CMAKE_PROJECT_NAME} SHARED module.cpp elf_util.cpp)
 
 add_subdirectory(Dobby)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE log dobby_static)
+option(LSPLANT_BUILD_SHARED off)
+add_subdirectory(LSPlant/lsplant/src/main/jni)
+include_directories(LSPlant/lsplant/src/main/jni/include)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE log dobby_static lsplant_static)

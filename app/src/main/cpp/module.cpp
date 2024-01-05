@@ -2,93 +2,67 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 #include <fstream>
+#include <sys/mman.h>
 #include <filesystem>
 #include "zygisk.hpp"
 #include "dobby.h"
 #include "json.hpp"
+#include "lsplant.hpp"
+#include "elf_util.h"
 
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "PIF/Native", __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "LSPlantDemo/Native", __VA_ARGS__)
 
-#define CLASSES_DEX "/data/adb/modules/playintegrityfix/classes.dex"
+#define _uintval(p)               reinterpret_cast<uintptr_t>(p)
+#define _ptr(p)                   reinterpret_cast<void *>(p)
+#define _align_up(x, n)           (((x) + ((n) - 1)) & ~((n) - 1))
+#define _align_down(x, n)         ((x) & -(n))
+#define _page_size                4096
+#define _page_align(n)            _align_up(static_cast<uintptr_t>(n), _page_size)
+#define _ptr_align(x)             _ptr(_align_down(reinterpret_cast<uintptr_t>(x), _page_size))
+#define _make_rwx(p, n)           ::mprotect(_ptr_align(p), \
+                                              _page_align(_uintval(p) + n) != _page_align(_uintval(p)) ? _page_align(n) + _page_size : _page_align(n), \
+                                              PROT_READ | PROT_WRITE | PROT_EXEC)
 
-#define PIF_JSON "/data/adb/pif.json"
-
-#define PIF_JSON_2 "/data/adb/modules/playintegrityfix/pif.json"
-
-static std::string FIRST_API_LEVEL, SECURITY_PATCH, BUILD_ID;
-
-typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
-
-static std::map<void *, T_Callback> callbacks;
-
-static void modify_callback(void *cookie, const char *name, const char *value, uint32_t serial) {
-
-    if (cookie == nullptr || name == nullptr || value == nullptr ||
-        !callbacks.contains(cookie))
-        return;
-
-    std::string_view prop(name);
-
-    if (prop.ends_with("security_patch")) {
-
-        if (!SECURITY_PATCH.empty()) {
-
-            value = SECURITY_PATCH.c_str();
-        }
-
-    } else if (prop.ends_with("api_level")) {
-
-        if (!FIRST_API_LEVEL.empty()) {
-
-            value = FIRST_API_LEVEL.c_str();
-        }
-
-    } else if (prop.ends_with("build.id")) {
-
-        if (!BUILD_ID.empty()) {
-
-            value = BUILD_ID.c_str();
-        }
-
-    } else if (prop == "sys.usb.state") {
-
-        value = "none";
-    }
-
-    if (!prop.starts_with("debug") && !prop.starts_with("cache") && !prop.starts_with("persist")) {
-
-        LOGD("[%s] -> %s", name, value);
-    }
-
-    return callbacks[cookie](cookie, name, value, serial);
+void* InlineHooker(void* target, void* hooker) {
+  _make_rwx(target, _page_size);
+  void* origin_call;
+  if (DobbyHook(target, hooker, &origin_call) == 0) {
+    return origin_call;
+  } else {
+    return nullptr;
+  }
 }
 
-static void (*o_system_property_read_callback)(const prop_info *, T_Callback, void *);
-
-static void
-my_system_property_read_callback(const prop_info *pi, T_Callback callback, void *cookie) {
-    if (pi == nullptr || callback == nullptr || cookie == nullptr) {
-        return o_system_property_read_callback(pi, callback, cookie);
-    }
-    callbacks[cookie] = callback;
-    return o_system_property_read_callback(pi, modify_callback, cookie);
+bool InlineUnhooker(void* func) {
+  return DobbyDestroy(func) == 0;
 }
 
-static void doHook() {
-    void *handle = DobbySymbolResolver("libc.so", "__system_property_read_callback");
-    if (handle == nullptr) {
-        LOGD("Couldn't find '__system_property_read_callback' handle. Report to @chiteroman");
-        return;
+static void doHook(JNIEnv *env) {
+  SandHook::ElfImg art("libart.so");
+
+#if !defined(__i386__)
+    dobby_enable_near_branch_trampoline();
+#endif
+
+    lsplant::InitInfo initInfo{
+      .inline_hooker = InlineHooker,
+      .inline_unhooker = InlineUnhooker,
+      .art_symbol_resolver = [&art](std::string_view symbol) -> void* {
+        return art.getSymbAddress(symbol);
+      },
+      .art_symbol_prefix_resolver = [&art](auto symbol) {
+        return art.getSymbPrefixFirstOffset(symbol);
+      },
+    };
+    bool ret = lsplant::Init(env, initInfo);
+    if (ret) {
+      LOGD("LSPlant init done");
+    } else {
+      LOGD("LSPlant init failed");
     }
-    LOGD("Found '__system_property_read_callback' handle at %p", handle);
-    DobbyHook(
-            handle,
-            reinterpret_cast<dobby_dummy_func_t>(my_system_property_read_callback),
-            reinterpret_cast<dobby_dummy_func_t *>(&o_system_property_read_callback)
-    );
 }
 
-class PlayIntegrityFix : public zygisk::ModuleBase {
+class LSPlantDemo : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         this->api = api;
@@ -96,183 +70,18 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-
-        auto name = env->GetStringUTFChars(args->nice_name, nullptr);
-
-        if (name == nullptr) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        std::string_view process(name);
-
-        bool isGms = process.starts_with("com.google.android.gms");
-        bool isGmsUnstable = process == "com.google.android.gms.unstable";
-
-        env->ReleaseStringUTFChars(args->nice_name, name);
-
-        if (!isGms) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
-
-        if (!isGmsUnstable) {
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        long dexSize = 0, jsonSize = 0;
-
-        int fd = api->connectCompanion();
-
-        read(fd, &dexSize, sizeof(long));
-        read(fd, &jsonSize, sizeof(long));
-
-        vector.resize(dexSize);
-        read(fd, vector.data(), dexSize);
-
-        char jsonBufer[jsonSize];
-        read(fd, jsonBufer, jsonSize);
-
-        close(fd);
-
-        std::string_view jsonStr(jsonBufer, jsonSize);
-        json = nlohmann::json::parse(jsonStr, nullptr, false, true);
-
-        if (json.contains("FIRST_API_LEVEL")) {
-
-            if (json["FIRST_API_LEVEL"].is_number_integer()) {
-
-                FIRST_API_LEVEL = std::to_string(json["FIRST_API_LEVEL"].get<int>());
-
-            } else if (json["FIRST_API_LEVEL"].is_string()) {
-
-                FIRST_API_LEVEL = json["FIRST_API_LEVEL"].get<std::string>();
-            }
-
-            json.erase("FIRST_API_LEVEL");
-
-        } else {
-
-            LOGD("JSON file doesn't contain FIRST_API_LEVEL key :(");
-        }
-
-        if (json.contains("SECURITY_PATCH")) {
-
-            if (json["SECURITY_PATCH"].is_string()) {
-
-                SECURITY_PATCH = json["SECURITY_PATCH"].get<std::string>();
-            }
-
-        } else {
-
-            LOGD("JSON file doesn't contain SECURITY_PATCH key :(");
-        }
-
-        if (json.contains("ID")) {
-
-            if (json["ID"].is_string()) {
-
-                BUILD_ID = json["ID"].get<std::string>();
-            }
-
-        } else if (json.contains("BUILD_ID")) {
-
-            if (json["BUILD_ID"].is_string()) {
-
-                BUILD_ID = json["BUILD_ID"].get<std::string>();
-            }
-
-        } else {
-
-            LOGD("JSON file doesn't contain ID/BUILD_ID keys :(");
-        }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (vector.empty() || json.empty()) return;
-
-        doHook();
-
-        LOGD("get system classloader");
-        auto clClass = env->FindClass("java/lang/ClassLoader");
-        auto getSystemClassLoader = env->GetStaticMethodID(clClass, "getSystemClassLoader",
-                                                           "()Ljava/lang/ClassLoader;");
-        auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
-
-        LOGD("create class loader");
-        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-        auto dexClInit = env->GetMethodID(dexClClass, "<init>",
-                                          "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-        auto buffer = env->NewDirectByteBuffer(vector.data(), vector.size());
-        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
-
-        LOGD("load class");
-        auto loadClass = env->GetMethodID(clClass, "loadClass",
-                                          "(Ljava/lang/String;)Ljava/lang/Class;");
-        auto entryClassName = env->NewStringUTF("es.chiteroman.playintegrityfix.EntryPoint");
-        auto entryClassObj = env->CallObjectMethod(dexCl, loadClass, entryClassName);
-
-        auto entryClass = (jclass) entryClassObj;
-
-        LOGD("call init");
-        auto entryInit = env->GetStaticMethodID(entryClass, "init", "(Ljava/lang/String;)V");
-        auto str = env->NewStringUTF(json.dump().c_str());
-        env->CallStaticVoidMethod(entryClass, entryInit, str);
-
-        vector.clear();
-        json.clear();
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs *args) override {
-        api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+      doHook(env);
     }
 
 private:
     zygisk::Api *api = nullptr;
     JNIEnv *env = nullptr;
-    std::vector<char> vector;
-    nlohmann::json json;
 };
 
-static void companion(int fd) {
-    std::ifstream dexFile(CLASSES_DEX, std::ios::in | std::ios::binary);
-
-    if (!dexFile) {
-        long i = 0;
-        write(fd, &i, sizeof(i));
-        return;
-    }
-
-    std::vector<char> dexVector((std::istreambuf_iterator<char>(dexFile)),
-                                std::istreambuf_iterator<char>());
-    long dexSize = dexVector.size();
-
-    std::ifstream jsonFile;
-
-    if (std::filesystem::exists(PIF_JSON)) {
-        jsonFile = std::ifstream(PIF_JSON, std::ios::in);
-    } else if (std::filesystem::exists(PIF_JSON_2)) {
-        jsonFile = std::ifstream(PIF_JSON_2, std::ios::in);
-    } else {
-        long i = 0;
-        write(fd, &i, sizeof(i));
-        return;
-    }
-
-    std::vector<char> jsonVector((std::istreambuf_iterator<char>(jsonFile)),
-                                 std::istreambuf_iterator<char>());
-    long jsonSize = jsonVector.size();
-
-    write(fd, &dexSize, sizeof(long));
-    write(fd, &jsonSize, sizeof(long));
-
-    write(fd, dexVector.data(), dexSize);
-    write(fd, jsonVector.data(), jsonSize);
-}
-
-REGISTER_ZYGISK_MODULE(PlayIntegrityFix)
-
-REGISTER_ZYGISK_COMPANION(companion)
+REGISTER_ZYGISK_MODULE(LSPlantDemo)
