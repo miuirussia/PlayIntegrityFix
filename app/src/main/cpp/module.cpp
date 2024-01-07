@@ -40,26 +40,22 @@ bool InlineUnhooker(void* func) {
 static void doHook(JNIEnv *env) {
   SandHook::ElfImg art("libart.so");
 
-#if !defined(__i386__)
-    dobby_enable_near_branch_trampoline();
-#endif
-
-    lsplant::InitInfo initInfo{
-      .inline_hooker = InlineHooker,
-      .inline_unhooker = InlineUnhooker,
-      .art_symbol_resolver = [&art](std::string_view symbol) -> void* {
-        return art.getSymbAddress(symbol);
-      },
-      .art_symbol_prefix_resolver = [&art](auto symbol) {
-        return art.getSymbPrefixFirstOffset(symbol);
-      },
-    };
-    bool ret = lsplant::Init(env, initInfo);
-    if (ret) {
-      LOGD("LSPlant init done");
-    } else {
-      LOGD("LSPlant init failed");
-    }
+  lsplant::InitInfo initInfo{
+    .inline_hooker = InlineHooker,
+    .inline_unhooker = InlineUnhooker,
+    .art_symbol_resolver = [&art](std::string_view symbol) -> void* {
+      return art.getSymbAddress(symbol);
+    },
+    .art_symbol_prefix_resolver = [&art](auto symbol) {
+      return art.getSymbPrefixFirstOffset(symbol);
+    },
+  };
+  bool ret = lsplant::Init(env, initInfo);
+  if (ret) {
+    LOGD("LSPlant init done");
+  } else {
+    LOGD("LSPlant init failed");
+  }
 }
 
 class LSPlantDemo : public zygisk::ModuleBase {
