@@ -66,6 +66,7 @@ public:
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+      doHook(env);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
